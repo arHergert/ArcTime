@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Lokale Zugangsdaten/Pfade, falls hier statt an zentraler Stelle abgelegt
+# (siehe README.md - normalerweise liegt die echte .env AUSSERHALB dieses
+# Ordners und muss daher gar nicht ignoriert werden, aber falls doch)
+.env
+
+# Der Cache-Ordner liegt standardmäßig ohnehin außerhalb dieses Ordners
+# (eine Ebene höher, z.B. G:\Programme\ArcTime\cache) und ist damit schon
+# strukturell kein Teil dieses Repos. Diese Zeile schützt nur für den Fall,
+# dass ARCTIME_CACHE_DIR mal hierher zeigt.
+/cache/
+/mediathek-cache/
+
+# Temporäre Dateien / Editoren / Betriebssystem
+*.tmp
+*.log
+.venv/
+venv/
+.idea/
+.vscode/
+Thumbs.db
+desktop.ini
+.DS_Store
