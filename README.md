@@ -153,3 +153,8 @@ Film- und Seriendaten stammen von [TMDB](https://www.themoviedb.org/) und
 [OMDb](https://www.omdbapi.com/), Spieldaten von [IGDB](https://www.igdb.com/).
 Dieses Projekt nutzt die TMDB-API, ist aber nicht von TMDB unterstützt oder
 zertifiziert.
+
+## Lizenz
+
+[MIT](LICENSE). Die mitgelieferte Schrift Inter steht unter der SIL Open Font
+License (siehe `fonts/LICENSE.txt`).
