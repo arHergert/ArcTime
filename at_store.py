@@ -121,6 +121,22 @@ def save_awards(a: dict):
     AFILE.write_text(json.dumps(a, ensure_ascii=False, indent=2), 'utf-8')
 
 
+# ── Top-10-Listen (top10.json): {"movie":[entryId,...], "season":[...], "game":[...]} ──
+TOPFILE = CACHE / "top10.json"
+
+def load_top() -> dict:
+    if TOPFILE.exists():
+        try:
+            d = json.loads(TOPFILE.read_text('utf-8'))
+            return d if isinstance(d, dict) else {}
+        except Exception:
+            pass
+    return {}
+
+def save_top(t: dict):
+    TOPFILE.write_text(json.dumps(t, ensure_ascii=False, indent=2), 'utf-8')
+
+
 # ── Konfiguration (Letterboxd-Sync) ───────────────────────────────────────────
 def load_config() -> dict:
     if CONFFILE.exists():

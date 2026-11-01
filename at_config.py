@@ -169,7 +169,23 @@ def _norm_title(s: str) -> str:
     return re.sub(r'[^a-z0-9]', '', (s or '').lower())
 
 # ── Episoden-Parser ────────────────────────────────────────────────────────────
+def _tidy_ep_name(name: str) -> str:
+    """Entfernt Reste von abgeschnittenen Qualitätsangaben: 'Downer Town (' -> 'Downer Town',
+    auch unausgeglichene Klammern und hängende Trennzeichen am Rand."""
+    name = re.sub(r'[\s(\[{\-–—_.,:;]+$', '', name or '')
+    name = re.sub(r'^[\s)\]}\-–—_.,:;]+', '', name)
+    if name.count('(') > name.count(')'):
+        name = name.replace('(', '')
+    if name.count('[') > name.count(']'):
+        name = name.replace('[', '')
+    return re.sub(r'\s+', ' ', name).strip()
+
 def parse_episode(path: Path) -> dict:
+    ep = _parse_episode(path)
+    ep['name'] = _tidy_ep_name(ep['name']) or ep['name']
+    return ep
+
+def _parse_episode(path: Path) -> dict:
     stem = path.stem
     m = re.search(r'[Ss](\d{1,2})\s*[Ee](\d{1,3})', stem)
     if m:

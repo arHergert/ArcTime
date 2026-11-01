@@ -112,6 +112,19 @@ function seriesStatus(e){
 
 // Manuelles Setzen/Zurücksetzen des Status-Badges direkt aus dem Tagebuch
 // (ohne das große Bewertungs-Modal öffnen zu müssen).
+async function toggleRewatch(id){
+  const e=diary.find(x=>x.id===id);
+  if(!e) return;
+  e.rewatch=!e.rewatch;
+  try{
+    await fetch('/api/diary',{
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({id, rewatch:e.rewatch})
+    });
+  }catch{ showToast('⚠ Rewatch konnte nicht gespeichert werden',true); }
+  renderDiary();
+}
+
 async function setStatusOverride(selectEl){
   const id=selectEl.dataset.id;
   const value=selectEl.value||null;
@@ -233,6 +246,10 @@ async function loadDiary(){
     const a=await fetch('/api/awards').then(r=>r.json());
     awards=a.awards||{};
   }catch{ awards={}; }
+  try{
+    const t=await fetch('/api/top').then(r=>r.json());
+    topLists=t.top||{};
+  }catch{ topLists={}; }
   // Im Hintergrund nachladen - blockiert die erste Anzeige nicht, aktualisiert
   // dann bei Bedarf die Status-Badges (v.a. "Completed"-Erkennung ohne Bibliotheks-Match).
   loadTmdbSeasonTotals().then(()=>{ if(currentTab==='diary') renderDiary(); });
@@ -267,7 +284,7 @@ function showProg(n,t,msg){
 function hideProg(){document.getElementById('prog-wrap').style.display='none';}
 
 // ── Tabs ──────────────────────────────────────────────────────────────────────
-const TABS=['movies','series','diary','stats','recommendations'];
+const TABS=['movies','series','diary','stats','recommendations','releases'];
 const GENRE_DE={
   Action:'Action',Adventure:'Abenteuer',Animation:'Animation',Biography:'Biografie',
   Comedy:'Komödie',Crime:'Krimi',Documentary:'Dokumentation',Drama:'Drama',
@@ -318,6 +335,7 @@ function switchTab(tab){
   if(tab==='diary'){ renderDiary(); }
   else if(tab==='stats'){ buildYearSelect(); renderStats(); }
   else if(tab==='recommendations'){ loadRecommendationsIfNeeded(); }
+  else if(tab==='releases'){ renderReleases(); loadReleases(true); loadRelSuggestions(); }
   else { buildGenreFilter(); render(); }
 }
 
@@ -776,7 +794,12 @@ async function loadEpisodes(key){
     const eps=data.episodes||[];
     // Verfügbare Staffeln fürs Bewertungs-Dropdown
     if(modalItem&&modalItem.key===key){
-      const seasons=[...new Set(eps.map(e=>e.season).filter(s=>s>0))].sort((a,b)=>a-b);
+      // Alle Staffeln der Serie (laut Metadaten), nicht nur die mit Dateien vor Ort
+      const set=new Set(eps.map(e=>e.season).filter(s=>s>0));
+      const total=parseInt(modalItem.seasons)||0;
+      for(let s=1;s<=total;s++) set.add(s);
+      diary.filter(d=>d.key===key&&d.kind==='season'&&d.season>0).forEach(d=>set.add(d.season));
+      const seasons=[...set].sort((a,b)=>a-b);
       modalItem._seasons=seasons.length?seasons:[1];
       if(!modalItem._seasons.includes(modalSeason)) modalSeason=modalItem._seasons[0];
       renderRateBox();
@@ -799,13 +822,22 @@ function renderEpisodes(eps,seriesKey){
       <div style="font-size:15px;margin-bottom:6px">Keine Folgen mehr gefunden.</div>
       <div style="font-size:13px;color:var(--muted);margin-bottom:16px">
         Serie komplett durchgeschaut und die Dateien schon gelöscht?
-        ${rated?'':'<br>Bitte zuerst unten bewerten, bevor du sie entfernst - danach bleibt der Tagebuch-Eintrag erhalten.'}
+        ${rated?'<br>Dein Tagebuch-Eintrag bleibt beim Entfernen erhalten.':'<br>Du kannst sie entfernen, ohne sie zu bewerten.'}
       </div>
       <button class="btn" id="ep-remove-series" style="margin:0 auto">
         <i class="fa-solid fa-trash-can"></i> Serie aus Bibliothek entfernen
       </button>
     </div>`;
-    document.getElementById('ep-remove-series').onclick=()=>removeSeriesFromLibrary(seriesKey);
+    const rmBtn=document.getElementById('ep-remove-series');
+    rmBtn.onclick=()=>{
+      // Inline-Nachfrage statt confirm()-Popup
+      rmBtn.outerHTML=`<div id="ep-remove-ask" style="display:flex;gap:10px;justify-content:center;align-items:center;flex-wrap:wrap">
+        <span style="font-size:14px">Serie wirklich entfernen?</span>
+        <button class="btn" id="ep-rm-yes">Ja</button>
+        <button class="btn" id="ep-rm-no">Nein</button></div>`;
+      document.getElementById('ep-rm-yes').onclick=()=>removeSeriesFromLibrary(seriesKey);
+      document.getElementById('ep-rm-no').onclick=()=>renderEpisodes(eps,seriesKey);
+    };
     return;
   }
 
@@ -818,10 +850,12 @@ function renderEpisodes(eps,seriesKey){
   // Staffelweise einklappbar: die zuletzt geöffnete/aktuelle Staffel
   // (modalSeason) startet aufgeklappt, alle anderen eingeklappt.
   const frag=document.createDocumentFragment();
+  // Aufgeklappt: die gewählte Staffel - gibt es zu ihr keine Dateien, die erste vorhandene
+  const openSeason=keys.includes(modalSeason)?modalSeason:(keys.find(k=>k>0)??keys[0]);
   keys.forEach(s=>{
     let rowsWrap=null;
     if(multi&&s>0){
-      const isOpen=s===modalSeason;
+      const isOpen=s===openSeason;
       const hdr=document.createElement('div');
       hdr.className='ep-season'+(isOpen?' open':'');
       hdr.innerHTML=`<i class="fa-solid fa-chevron-down"></i><span>Staffel ${s}</span>`;
@@ -1338,15 +1372,6 @@ function openTitleFix(event,btn){
 
 async function removeSeriesFromLibrary(key){
   const rated=diary.some(e=>e.key===key&&e.kind==='season');
-  if(!rated){
-    showToast('⚠ Bitte erst eine Staffel bewerten, dann entfernen',true);
-    document.getElementById('m-rate')?.scrollIntoView({behavior:'smooth',block:'center'});
-    return;
-  }
-  const m=modalItem;
-  if(!confirm(`"${m?m.t:'Serie'}" wirklich aus der Bibliothek entfernen?
-
-Der Tagebuch-Eintrag/deine Bewertung bleibt erhalten. Die Serie taucht nicht wieder auf, solange der Ordner leer bleibt.`)) return;
   try{
     const d=await fetch('/api/library?key='+encodeURIComponent(key),{method:'DELETE'}).then(r=>r.json());
     if(!d.ok){ showToast('⚠ '+(d.error||'Fehler'),true); return; }
@@ -1620,6 +1645,7 @@ function renderDiary(){
           ${rwIcon}
         </div>
         <div class="dactions">
+          <button class="dbtn rwtoggle${e.rewatch?' active':''}" data-id="${e.id}" onclick="toggleRewatch(this.dataset.id)" title="${e.rewatch?'Als Erstsichtung markieren':'Als Rewatch markieren'}">↻</button>
           <button class="dbtn nom${nn?' active':''}" data-id="${e.id}" onclick="toggleNomPanel(this.dataset.id)" title="Nominieren"><i class="fa-solid fa-trophy"></i>${nn?' '+nn:''}</button>
           <button class="dbtn" data-id="${e.id}" onclick="openFromDiary(this.dataset.id)">Öffnen</button>
           <button class="dbtn del" data-id="${e.id}" onclick="delDiary(this.dataset.id)" title="Löschen">✕</button>
@@ -2353,12 +2379,20 @@ function buildYearSelect(){
   const cur=new Date().getFullYear().toString();
   if(!years.includes(cur)) years.unshift(cur);
   const prev=sel.value;
-  sel.innerHTML=years.map(y=>`<option value="${y}">${y}</option>`).join('');
-  if(years.includes(prev)) sel.value=prev;
+  sel.innerHTML=`<option value="all">Gesamt</option><option value="top10">★ Meine Top 10</option>`+years.map(y=>`<option value="${y}">${y}</option>`).join('');
+  sel.value=(prev==='all'||years.includes(prev))?prev:years[0];   // Standard: aktuelles Jahr
 }
 
 function renderStats(){
   const year=document.getElementById('statsYear').value;
+  if(year==='all'){ renderStatsAll(); return; }
+  if(year==='top10'){
+    document.getElementById('stats-body').innerHTML=`<div class="stats-wide stats-3col">
+      <div class="swide-card" id="top10-movie"></div>
+      <div class="swide-card" id="top10-season"></div>
+      <div class="swide-card" id="top10-game"></div></div>`;
+    renderTop10(); return;
+  }
   const ent=diary.filter(e=>(e.date||'').startsWith(year));
   const body=document.getElementById('stats-body');
 
@@ -2412,8 +2446,7 @@ function renderStats(){
       </div>
       <div class="scard">
         <div class="scard-lbl">Ø Bewertung</div>
-        <div class="sbig">${avg?avg.toFixed(2):'–'}<span class="sunit">/ 5</span></div>
-        <div style="margin-top:8px">${starsHTML(Math.round(avg*2)/2)}</div>
+        <div class="sbig">${avg?(avg*2).toFixed(2):'–'}<span class="sunit">/ 10</span></div>
       </div>
       <div class="scard">
         <div class="scard-lbl">Aktivster Monat</div>
@@ -2459,7 +2492,7 @@ function renderStats(){
             <div class="rcol">
               <span class="mval">${n||''}</span>
               <div class="rbar" style="height:${n/maxD*72}px"></div>
-              <span class="rlbl">${(+v).toFixed(1)}</span>
+              <span class="rlbl">${fmt10(+v)}</span>
             </div>`).join('')}
         </div>
       </div>`:''}
@@ -2473,7 +2506,7 @@ function renderStats(){
               <span class="toprank">${i+1}</span>
               <span class="topname">${esc(e.title)}${e.kind==='season'
                 ?` <span style="color:var(--muted);font-size:11px">S${String(e.season||1).padStart(2,'0')}</span>`:''}</span>
-              ${starsHTML(e.rating,true)}
+              <span class="r10">${fmt10(e.rating)}</span>
             </div>`).join('')}
         </div>
       </div>`:''}
@@ -2485,6 +2518,395 @@ function renderStats(){
       ${awardsHTML(year,ent,'game')}
     </div>`;
   bindAwards(year);
+}
+
+// ── Top 10 (selbst zusammengestellt, per Drag & Drop sortierbar) ──────────────
+let topLists={}, top10Drag=null, top10Timer=null;
+const T10_TITLE={movie:'Top 10 Filme',season:'Top 10 Serien',game:'Top 10 Spiele'};
+
+// Listeneinträge: String = Tagebuch-ID, Objekt = externer Treffer (TMDB/IGDB) ohne Tagebucheintrag
+function top10Items(kind){
+  return (topLists[kind]||[]).map(raw=>{
+    if(typeof raw==='string'){ const e=diary.find(x=>x.id===raw); return e?{raw,e}:null; }
+    return raw&&raw.title?{raw,e:{...raw,id:null}}:null;
+  }).filter(Boolean);
+}
+
+async function saveTop10(kind,raws){
+  topLists[kind]=raws.slice(0,10);
+  renderTop10Kind(kind);
+  try{
+    const d=await fetch('/api/top',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({kind,ids:topLists[kind]})}).then(r=>r.json());
+    if(d.ok&&d.top) topLists=d.top;     // Server hat externe Cover lokal abgelegt
+    renderTop10Kind(kind);
+  }catch{ showToast('⚠ Top 10 konnte nicht gespeichert werden',true); }
+}
+
+function top10Label(e){
+  return e.title+(e.kind==='season'&&!e.ext?` S${String(e.season||1).padStart(2,'0')}`:'');
+}
+
+function top10Updated(kind){
+  const iso=(topLists._updated||{})[kind];
+  if(!iso) return '';
+  const d=new Date(iso);
+  if(isNaN(d)) return '';
+  const pad=n=>String(n).padStart(2,'0');
+  return `<span class="t10-upd">Zuletzt bearbeitet: ${pad(d.getDate())}.${pad(d.getMonth()+1)}.${d.getFullYear()}, ${pad(d.getHours())}:${pad(d.getMinutes())}</span>`;
+}
+
+function renderTop10(){ ['movie','season','game'].forEach(renderTop10Kind); }
+
+function renderTop10Kind(kind){
+  const box=document.getElementById('top10-'+kind);
+  if(!box) return;
+  const items=top10Items(kind);
+  const raws=()=>items.map(i=>i.raw);
+
+  const slots=Array.from({length:10},(_,i)=>{
+    const it=items[i], e=it&&it.e;
+    if(!e) return `<div class="t10-slot empty" data-i="${i}"><span class="t10-rank">${i+1}</span><span class="t10-plus">+</span></div>`;
+    const img=e.poster?`<img src="${e.poster}" alt="" draggable="false">`
+      :`<div class="t10-noimg">${esc(e.title)}</div>`;
+    return `<div class="t10-slot" draggable="true" data-i="${i}" title="${esc(top10Label(e))}">
+      <span class="t10-rank">${i+1}</span>${img}
+      <button class="t10-x" data-i="${i}" title="Entfernen">✕</button>
+      <div class="t10-name">${esc(top10Label(e))}</div>
+    </div>`;
+  }).join('');
+
+  box.innerHTML=`
+    <div class="t10-head">
+      <div class="scard-lbl" style="margin:0">${T10_TITLE[kind]}</div>
+      <div class="t10-search">
+        <input type="text" id="t10-q-${kind}" placeholder="Titel suchen und hinzufügen…" autocomplete="off" ${items.length>=10?'disabled':''}>
+        <div class="t10-results" id="t10-res-${kind}" hidden></div>
+      </div>
+      ${items.length?'':`<button class="btn btn-ghost" id="t10-fill-${kind}">Aus besten Wertungen füllen</button>`}
+    </div>
+    <div class="t10-grid">${slots}</div>
+    <div class="t10-foot"><span class="t10-hint">${items.length>1?'Zum Sortieren Poster ziehen und auf einen anderen Platz fallen lassen.':'Suche oben einen Titel, um ihn hinzuzufügen.'}</span>
+      ${top10Updated(kind)}</div>`;
+
+  // Entfernen
+  box.querySelectorAll('.t10-x').forEach(b=>b.onclick=ev=>{
+    ev.stopPropagation();
+    const r=raws(); r.splice(+b.dataset.i,1);
+    saveTop10(kind,r);
+  });
+  // Drag & Drop
+  box.querySelectorAll('.t10-slot').forEach(s=>{
+    const i=+s.dataset.i;
+    if(s.draggable) s.ondragstart=ev=>{
+      top10Drag=i; s.classList.add('dragging');
+      ev.dataTransfer.effectAllowed='move'; ev.dataTransfer.setData('text/plain',String(i));
+    };
+    s.ondragend=()=>{ top10Drag=null; box.querySelectorAll('.t10-slot').forEach(x=>x.classList.remove('dragging','over')); };
+    s.ondragover=ev=>{ if(top10Drag===null) return; ev.preventDefault(); s.classList.add('over'); };
+    s.ondragleave=()=>s.classList.remove('over');
+    s.ondrop=ev=>{
+      ev.preventDefault();
+      if(top10Drag===null) return;
+      const r=raws();
+      const to=Math.min(i,r.length-1);
+      const [moved]=r.splice(top10Drag,1);
+      r.splice(to,0,moved);
+      top10Drag=null;
+      saveTop10(kind,r);
+    };
+  });
+  // Autovorschlag
+  const fill=document.getElementById('t10-fill-'+kind);
+  if(fill) fill.onclick=()=>saveTop10(kind,top10Suggest(kind).slice(0,10).map(e=>e.id));
+  // Suche über die Online-Datenbanken (TMDB / IGDB)
+  const q=document.getElementById('t10-q-'+kind), res=document.getElementById('t10-res-'+kind);
+  if(!q) return;
+  const hitHTML=(img,name,year,right,attrs)=>`<div class="t10-hit" ${attrs}>
+      ${img?`<img src="${img}" alt="">`:'<span class="t10-hit-ph"></span>'}
+      <span class="t10-hit-name">${esc(name)}<small>${esc(year||'')}</small></span>${right||''}</div>`;
+  let token=0;
+  const run=()=>{
+    const my=++token;
+    clearTimeout(top10Timer);
+    const raw=q.value.trim();
+    const term=raw.toLowerCase().replace(/[.\-_:]+/g,' ');
+    if(!term){ res.hidden=true; return; }
+    const takenExt=new Set(items.map(i=>(i.e.title+'|'+i.e.year).toLowerCase()));
+    // Immer Online-Suche (entprellt)
+    res.innerHTML='<div class="t10-none">Suche…</div>'; res.hidden=false;
+    top10Timer=setTimeout(async()=>{
+      let cands=[];
+      try{
+        if(kind==='game'){
+          const d=await fetch('/api/games/search?title='+encodeURIComponent(raw)).then(r=>r.json());
+          cands=(d.results||[]).map(r=>({title:r.title,year:r.year,poster:r.cover}));
+        }else{
+          const d=await fetch('/api/title-search?kind='+(kind==='season'?'series':'movie')+'&q='+encodeURIComponent(raw)).then(r=>r.json());
+          cands=(d.candidates||[]).map(r=>({title:r.title,year:r.year,poster:r.poster}));
+        }
+      }catch{}
+      if(my!==token) return;     // neuere Eingabe hat Vorrang
+      cands=cands.filter(c=>!takenExt.has((c.title+'|'+c.year).toLowerCase()));
+      if(!cands.length){ res.innerHTML='<div class="t10-none">Nichts gefunden</div>'; return; }
+      res.innerHTML=cands.slice(0,8).map((c,i)=>hitHTML(c.poster,c.title,c.year,'','data-x="'+i+'"')).join('');
+      res.querySelectorAll('.t10-hit').forEach(h=>h.onmousedown=ev=>{
+        ev.preventDefault();
+        const c=cands[+h.dataset.x];
+        saveTop10(kind,[...raws(),{ext:true,kind,title:c.title,year:c.year,poster:c.poster}]);
+      });
+    },350);
+  };
+  q.oninput=run;
+  q.onfocus=run;
+  q.onblur=()=>setTimeout(()=>{res.hidden=true;},150);
+}
+
+// Vorschlag: beste Wertungen, je Titel einmal, ohne Rewatches
+function top10Suggest(kind){
+  const seen=new Set();
+  return diary.filter(e=>e.kind===kind&&e.rating&&!e.rewatch)
+    .sort((a,b)=>b.rating-a.rating||(b.date||'').localeCompare(a.date||''))
+    .filter(e=>{const k=kind==='season'?top10Label(e):e.title.toLowerCase(); if(seen.has(k)) return false; seen.add(k); return true;});
+}
+
+// ── Gesamtauswertung (alle Jahre) ─────────────────────────────────────────────
+let statsAllKind='all';   // all | movie | season | game
+const KIND_LBL={movie:'Filme',season:'Serien',game:'Spiele'};
+const KIND_COL={movie:'var(--accent2)',season:'var(--accent3)',game:'var(--accent)'};
+const WEEKDAYS=['Mo','Di','Mi','Do','Fr','Sa','So'];
+
+function statsAllToggle(){
+  return `<div class="seg-toggle">${
+    [['all','Alle'],['movie','Filme'],['season','Serien'],['game','Spiele']].map(([k,l])=>
+      `<button class="${statsAllKind===k?'on':''}" onclick="setStatsAllKind('${k}')">${l}</button>`).join('')}</div>`;
+}
+// Interne Wertung ist 0.5-5 Sterne; Rankings zeigen sie als 1-10.
+const fmt10=v=>String(Math.round(v*2*10)/10);
+function setStatsAllKind(k){ statsAllKind=k; renderStatsAll(); }
+
+function niceMax(m){
+  const p=Math.pow(10,Math.floor(Math.log10(m))), n=m/p;
+  return (n<=1?1:n<=2?2:n<=5?5:10)*p;
+}
+
+// Balkendiagramm mit Gitterlinien. cols: [{label, top, tip, segs:[{v,col,tip}]}]
+function barChartHTML(cols,max,opts={}){
+  const ticks=opts.ticks||4;
+  const grid=Array.from({length:ticks+1},(_,i)=>{
+    const v=max/ticks*(ticks-i);
+    return `<div class="bc-grid" style="bottom:${(ticks-i)/ticks*100}%"><span>${opts.axisFmt?opts.axisFmt(v):Math.round(v)}</span></div>`;
+  }).join('');
+  const avgLine=opts.avg
+    ?`<div class="bc-avg" style="bottom:${opts.avg/max*100}%"><span>Ø ${opts.avg.toFixed(2)}</span></div>`:'';
+  const bars=cols.map(c=>{
+    const total=c.segs.reduce((a,x)=>a+x.v,0);
+    const segs=c.segs.filter(x=>x.v>0).map(x=>
+      `<div class="bc-seg" style="height:${x.v/max*100}%;background:${x.col}" title="${esc(x.tip||'')}"></div>`).join('');
+    return `<div class="bc-col" title="${esc(c.tip||'')}">
+      <div class="bc-stack">${segs}</div>
+      <span class="bc-val" style="bottom:calc(${total/max*100}% + 3px)">${c.top||''}</span>
+      <span class="bc-lbl">${c.label}</span>
+    </div>`;
+  }).join('');
+  return `<div class="bc">${grid}${avgLine}<div class="bc-cols">${bars}</div></div>`;
+}
+
+function renderStatsAll(){
+  const body=document.getElementById('stats-body');
+  const all=diary.filter(e=>(e.date||'').length>=4);
+  if(!all.length){ body.innerHTML='<div class="dempty">Noch keine Einträge.</div>'; return; }
+
+  const kinds=statsAllKind==='all'?['movie','season','game']:[statsAllKind];
+  const ent=all.filter(e=>kinds.includes(e.kind));
+  const rated=ent.filter(e=>e.rating);
+  const avg=a=>a.length?a.reduce((s,e)=>s+e.rating,0)/a.length*2:0;   // 10er-Skala
+  const overall=avg(rated);
+
+  if(!ent.length){
+    body.innerHTML=`<div class="stats-toolbar">${statsAllToggle()}</div><div class="dempty">Keine Einträge für diese Auswahl.</div>`;
+    return;
+  }
+  const years=[...new Set(ent.map(e=>e.date.slice(0,4)))].sort();
+  const minY=+years[0], maxY=+years[years.length-1];
+  const span=[]; for(let y=minY;y<=maxY;y++) span.push(String(y));   // auch Jahre ohne Einträge
+
+  const perYear=y=>ent.filter(e=>e.date.startsWith(y));
+  const cnt=span.map(y=>perYear(y).length);
+  const avgs=span.map(y=>avg(perYear(y).filter(e=>e.rating)));
+
+  // Kennzahlen
+  const bestCnt=Math.max(...cnt), busiestYear=span[cnt.indexOf(bestCnt)];
+  const ratedYears=span.filter((y,i)=>avgs[i]>0&&perYear(y).filter(e=>e.rating).length>=5);
+  const bestYear=ratedYears.length
+    ?ratedYears.reduce((a,b)=>avgs[span.indexOf(b)]>avgs[span.indexOf(a)]?b:a):null;
+  const rewatch=ent.filter(e=>e.rewatch).length;
+  const perKind=k=>ent.filter(e=>e.kind===k).length;
+  const fiveStar=rated.filter(e=>e.rating>=5).length;
+
+  const toggle=statsAllToggle();
+
+  // Anzahl pro Jahr (bei "Alle" gestapelt nach Medium)
+  const cMax=niceMax(Math.max(...cnt,1));
+  const cntChart=barChartHTML(span.map((y,i)=>({
+    label:y.slice(2), top:cnt[i]||'',
+    tip:`${y}: ${cnt[i]} Einträge`,
+    segs:kinds.map(k=>{
+      const n=perYear(y).filter(e=>e.kind===k).length;
+      return {v:n,col:KIND_COL[k],tip:`${y} · ${KIND_LBL[k]}: ${n}`};
+    })
+  })),cMax,{ticks:cMax>=5?5:cMax});
+
+  // Ø Bewertung pro Jahr, gestrichelte Linie = Gesamtschnitt
+  const avgChart=barChartHTML(span.map((y,i)=>({
+    label:y.slice(2), top:avgs[i]?avgs[i].toFixed(2):'',
+    tip:`${y}: Ø ${avgs[i]?avgs[i].toFixed(2):'–'} aus ${perYear(y).filter(e=>e.rating).length} Bewertungen`,
+    segs:[{v:avgs[i],col:statsAllKind==='all'?'var(--chart)':KIND_COL[statsAllKind]}]
+  })),10,{ticks:5,avg:overall,axisFmt:v=>v.toFixed(0)});
+
+  // Heatmap Jahr × Monat
+  const hm=span.map(y=>{
+    const m=Array(12).fill(0);
+    perYear(y).forEach(e=>{const i=+e.date.slice(5,7)-1; if(i>=0&&i<12) m[i]++;});
+    return m;
+  });
+  const hmMax=Math.max(...hm.flat(),1);
+  const heat=`<div class="heat">
+    <div class="heat-row heat-head"><span></span>${MSHORT.map(m=>`<span>${m}</span>`).join('')}</div>
+    ${span.slice().reverse().map(y=>{
+      const r=hm[span.indexOf(y)];
+      return `<div class="heat-row"><span class="heat-y">${y}</span>${r.map((n,i)=>
+        `<span class="heat-c" style="--t:${n?(0.18+0.82*n/hmMax).toFixed(2):0}" title="${MONTHS[i]} ${y}: ${n}">${n||''}</span>`).join('')}</div>`;
+    }).join('')}</div>`;
+
+  // Bewertungsverteilung
+  const dist={}; for(let v=0.5;v<=5;v+=0.5) dist[v]=0;
+  rated.forEach(e=>{ if(dist[e.rating]!==undefined) dist[e.rating]++; });
+  const maxD=Math.max(...Object.values(dist),1);
+  const distHTML=`<div class="rdist" style="height:110px">${Object.entries(dist).map(([v,n])=>`
+    <div class="rcol"><span class="mval">${n||''}</span>
+    <div class="rbar" style="height:${n/maxD*84}px" title="${n} × ${fmt10(+v)}/10"></div>
+    <span class="rlbl">${fmt10(+v)}</span></div>`).join('')}</div>`;
+
+  // Genres mit Ø-Bewertung
+  const gc={};
+  ent.forEach(e=>(e.genre||'').split(',').map(g=>g.trim()).filter(Boolean).forEach(g=>{
+    const o=gc[g]||(gc[g]={n:0,sum:0,r:0}); o.n++; if(e.rating){o.sum+=e.rating;o.r++;}}));
+  const genres=Object.entries(gc).sort((a,b)=>b[1].n-a[1].n).slice(0,10);
+  const maxG=genres.length?genres[0][1].n:1;
+  const genHTML=genres.map(([g,o])=>`<div class="genrow">
+    <span class="genname">${esc(genreLabel(g))}</span>
+    <div class="genbar-bg"><div class="genbar" style="width:${o.n/maxG*100}%"></div></div>
+    <span class="genval">${o.n}</span>
+    <span class="genavg" title="Ø Bewertung">${o.r?'Ø '+(o.sum/o.r*2).toFixed(1):''}</span></div>`).join('');
+
+  // Wochentage
+  const wd=Array(7).fill(0);
+  ent.forEach(e=>{
+    if(e.date.length>=10){
+      const d=new Date(e.date.slice(0,10)+'T12:00:00');
+      if(!isNaN(d)) wd[(d.getDay()+6)%7]++;
+    }
+  });
+  const maxW=Math.max(...wd,1);
+  const wdHTML=`<div class="months" style="grid-template-columns:repeat(7,1fr)">${wd.map((n,i)=>`
+    <div class="mcell"><span class="mval">${n||''}</span>
+    <div class="mbar-wrap"><div class="mbar" style="height:${n/maxW*100}%"></div></div>
+    <span class="mlbl">${WEEKDAYS[i]}</span></div>`).join('')}</div>`;
+
+  // Jahrzehnte der Titel (Erscheinungsjahr)
+  const dec={};
+  ent.forEach(e=>{const y=parseInt(e.year); if(y>=1900){const d=Math.floor(y/10)*10; dec[d]=(dec[d]||0)+1;}});
+  const decs=Object.entries(dec).sort((a,b)=>a[0]-b[0]);
+  const maxDec=Math.max(...decs.map(d=>d[1]),1);
+  const decHTML=decs.length?`<div class="months" style="grid-template-columns:repeat(${decs.length},1fr)">${decs.map(([d,n])=>`
+    <div class="mcell"><span class="mval">${n}</span>
+    <div class="mbar-wrap"><div class="mbar" style="height:${n/maxDec*100}%"></div></div>
+    <span class="mlbl">${d}er</span></div>`).join('')}</div>`:'<div class="aw-empty">Keine Erscheinungsjahre vorhanden</div>';
+
+  // Bestenliste aller Zeiten (ohne Rewatches; Filme/Spiele nur einmal)
+  const seen=new Set();
+  const top=rated.filter(e=>!e.rewatch)
+    .sort((a,b)=>b.rating-a.rating||b.date.localeCompare(a.date))
+    .filter(e=>{
+      if(e.kind==='season') return true;
+      const k=(e.key||e.title)+'|'+e.kind;
+      if(seen.has(k)) return false; seen.add(k); return true;
+    }).slice(0,10);
+  const topHTML=top.map((e,i)=>`<div class="toprow">
+    <span class="toprank">${i+1}</span>
+    ${e.poster?`<img class="top-cover" src="${e.poster}" alt="" loading="lazy">`:'<span class="top-cover"></span>'}
+    <span class="topname">${esc(e.title)}${e.kind==='season'?` <span class="tsub">S${String(e.season||1).padStart(2,'0')}</span>`:''}
+      <span class="tsub">· ${e.date.slice(0,4)}</span></span>
+    <span class="r10">${fmt10(e.rating)}</span></div>`).join('');
+
+  // Gewinner je Jahr
+  const winnerCell=(y,cat,kind)=>{
+    const id=(awards[y]||{})[cat], e=id&&diary.find(x=>x.id===id);
+    if(!e) return '<td class="win-none">–</td>';
+    const sub=kind==='season'?` <span class="tsub">S${String(e.season||1).padStart(2,'0')}</span>`:'';
+    return `<td>${esc(e.title)}${sub}</td>`;
+  };
+  const winCats={movie:'f_best',season:'s_best',game:'g_best'};
+  const winYears=span.slice().reverse().filter(y=>kinds.some(k=>(awards[y]||{})[winCats[k]]));
+  const winnersHTML=winYears.length?`<table class="win-table"><thead><tr><th>Jahr</th>
+      ${kinds.includes('movie')?'<th>Bester Film</th>':''}${kinds.includes('season')?'<th>Beste Serie</th>':''}${kinds.includes('game')?'<th>Bestes Spiel</th>':''}
+    </tr></thead><tbody>${winYears.map(y=>`<tr><td class="win-y">${y}</td>
+      ${kinds.includes('movie')?winnerCell(y,'f_best','movie'):''}
+      ${kinds.includes('season')?winnerCell(y,'s_best','season'):''}
+      ${kinds.includes('game')?winnerCell(y,'g_best','game'):''}</tr>`).join('')}</tbody></table>`:'';
+
+  const legend=statsAllKind==='all'
+    ?`<div class="bc-legend">${['movie','season','game'].map(k=>
+        `<span><i style="background:${KIND_COL[k]}"></i>${KIND_LBL[k]}</span>`).join('')}</div>`:'';
+
+  body.innerHTML=`
+    <div class="stats-toolbar">${toggle}</div>
+    <div class="stats-grid">
+      <div class="scard">
+        <div class="scard-lbl">Einträge gesamt</div>
+        <div class="sbig">${ent.length}<span class="sunit">seit ${minY}</span></div>
+        <div class="ssplit">${kinds.map(k=>`<div><b>${perKind(k)}</b>${KIND_LBL[k]}</div>`).join('')}</div>
+      </div>
+      <div class="scard">
+        <div class="scard-lbl">Ø Bewertung</div>
+        <div class="sbig">${overall?overall.toFixed(2):'–'}<span class="sunit">/ 10</span></div>
+        <div class="ssplit"><div><b>${rated.length}</b>bewertet</div><div><b>${fiveStar}</b>× 10/10</div></div>
+      </div>
+      <div class="scard">
+        <div class="scard-lbl">Aktivstes Jahr</div>
+        <div class="sbig">${busiestYear}</div>
+        <div class="ssplit"><div><b>${bestCnt}</b>Einträge</div></div>
+      </div>
+      <div class="scard">
+        <div class="scard-lbl">Bestes Jahr</div>
+        <div class="sbig">${bestYear||'–'}</div>
+        <div class="ssplit">${bestYear?`<div><b>Ø ${avgs[span.indexOf(bestYear)].toFixed(2)}</b>ab 5 Bewertungen</div>`:''}</div>
+      </div>
+      <div class="scard">
+        <div class="scard-lbl">Erneut gesehen</div>
+        <div class="sbig">${rewatch}</div>
+        <div class="ssplit"><div><b>${ent.length?Math.round(rewatch/ent.length*100):0}%</b>aller Einträge</div></div>
+      </div>
+    </div>
+
+    <div class="stats-wide">
+      <div class="stats-2col">
+        <div class="swide-card"><div class="scard-lbl">Anzahl pro Jahr</div>${legend}${cntChart}</div>
+        <div class="swide-card"><div class="scard-lbl">Ø Bewertung pro Jahr</div>${avgChart}</div>
+      </div>
+      <div class="swide-card"><div class="scard-lbl">Aktivität nach Monat</div>${heat}</div>
+      <div class="stats-2col">
+        <div class="swide-card"><div class="scard-lbl">Bewertungsverteilung</div>${distHTML}</div>
+        <div class="swide-card"><div class="scard-lbl">Lieblingsgenres</div>${genHTML||'<div class="aw-empty">Keine Genres</div>'}</div>
+        <div class="swide-card"><div class="scard-lbl">Wochentage</div>${wdHTML}</div>
+        <div class="swide-card"><div class="scard-lbl">Jahrzehnte der Titel</div>${decHTML}</div>
+      </div>
+      <div class="stats-2col">
+        ${top.length?`<div class="swide-card"><div class="scard-lbl">Beste Wertungen aller Zeiten</div><div class="toplist">${topHTML}</div></div>`:''}
+        ${winnersHTML?`<div class="swide-card"><div class="scard-lbl">Gewinner je Jahr</div>${winnersHTML}</div>`:''}
+      </div>
+    </div>`;
 }
 
 // ── Awards: Nominierte je Kategorie, Gewinner per Klick ───────────────────────
@@ -2505,8 +2927,10 @@ function awardsHTML(year,ent,type){
             ? `${esc(person.name)} <span style="color:var(--muted);font-weight:400">— ${esc(e.title)}${sub}</span>`
             : `${esc(e.title)}${sub}`;
           const icon=e.kind==='season'?'S':e.kind==='game'?'G':'F';
-          const cover=e.poster
-            ? `<img class="aw-nom-cover" src="${e.poster}" alt="" loading="lazy">`
+          // Schauspieler-Kategorien: Foto der Person (bereits heruntergeladen), sonst Filmcover
+          const img=(person&&person.photo)||e.poster;
+          const cover=img
+            ? `<img class="aw-nom-cover" src="${img}" alt="" loading="lazy">`
             : `<div class="aw-nom-cover-ph">${icon}</div>`;
           return `<div class="aw-nom${isWin?' win':''}" data-cat="${c.id}" data-eid="${e.id}">
             <span class="aw-crown">${isWin?'✓':'○'}</span>
@@ -2936,3 +3360,583 @@ async function backfillCoversLoop(){
 setupImport();
 setupLb();
 init().then(()=>{ silentLetterboxdSync(); backfillCoversLoop(); });
+
+// ── Releases: Erinnerungen, Glocke, Push ──────────────────────────────────────
+let relState={alerts:[],notifications:[],last_check:null,push:{available:false,subscriptions:0,key:null}};
+let relMedia='all', relEditing=null, relSug={status:'idle',items:[]}, relSeenNotifs=null, relSearchTimer=null, relSearchToken=0, relLoaded=false;
+const REL_COUNTRY={US:'USA',DE:'Deutschland'};
+
+async function loadReleases(silent){
+  try{
+    const d=await fetch('/api/releases').then(r=>r.json());
+    applyRelState(d,silent);
+  }catch{}
+}
+
+function applyRelState(d,silent){
+  if(!d||!d.alerts) return;
+  const prev=relSeenNotifs;
+  relState=d; relLoaded=true;
+  const ids=new Set(d.notifications.map(n=>n.id));
+  // neue Meldungen, während die Seite offen ist -> Hinweis
+  if(prev&&!silent){
+    d.notifications.filter(n=>!prev.has(n.id)&&!n.read).forEach(n=>
+      showToast(`🔔 ${n.title}${n.rest||' ist jetzt erhältlich'}`));
+  }
+  relSeenNotifs=ids;
+  renderBell();
+  if(currentTab==='releases') renderReleases();
+}
+
+// ── Datum-Helfer ──────────────────────────────────────────────────────────────
+function relFmtDate(iso){
+  if(!iso) return '';
+  const d=new Date(iso.slice(0,10)+'T12:00:00');
+  return d.toLocaleDateString('de-DE',{day:'numeric',month:'long',year:'numeric'});
+}
+function relDays(iso){
+  const t=new Date(); t.setHours(12,0,0,0);
+  return Math.round((new Date(iso.slice(0,10)+'T12:00:00')-t)/86400000);
+}
+function relWhen(iso){
+  const n=relDays(iso);
+  if(n===0) return 'heute';
+  if(n===1) return 'morgen';
+  if(n===-1) return 'gestern';
+  if(n>1) return `in ${n} Tagen`;
+  return `vor ${-n} Tagen`;
+}
+function relSource(r){
+  if(!r) return '';
+  if(r.country) return `${r.type} · ${REL_COUNTRY[r.country]||r.country}`;
+  return r.type==='Eigener Termin'?'Von dir eingetragen':r.type;
+}
+function relAgo(iso){
+  if(!iso) return 'noch nie';
+  const d=new Date(iso), n=relDays(iso.slice(0,10));
+  const hm=d.toLocaleTimeString('de-DE',{hour:'2-digit',minute:'2-digit'});
+  return (n===0?'heute':n===-1?'gestern':relFmtDate(iso))+', '+hm+' Uhr';
+}
+
+// ── Glocke ────────────────────────────────────────────────────────────────────
+function relUnread(){ return relState.notifications.filter(n=>!n.read).length; }
+
+function renderBell(){
+  const badge=document.getElementById('bellBadge');
+  if(!badge) return;
+  const n=relUnread();
+  badge.hidden=!n; badge.textContent=n>9?'9+':n;
+  document.getElementById('bellBtn').classList.toggle('has-new',n>0);
+  if(!document.getElementById('bellPanel').hidden) renderBellPanel();
+}
+
+function toggleBell(ev){
+  ev.stopPropagation();
+  const p=document.getElementById('bellPanel'), open=p.hidden;
+  p.hidden=!open;
+  document.getElementById('bellBtn').setAttribute('aria-expanded',String(open));
+  if(open){ renderBellPanel(); loadReleases(true); }
+}
+function closeBell(){
+  const p=document.getElementById('bellPanel');
+  if(p&&!p.hidden){ p.hidden=true; document.getElementById('bellBtn').setAttribute('aria-expanded','false'); }
+}
+document.addEventListener('click',ev=>{ if(!ev.target.closest('.bell-wrap')) closeBell(); });
+document.addEventListener('keydown',ev=>{ if(ev.key==='Escape') closeBell(); });
+
+function renderBellPanel(){
+  const p=document.getElementById('bellPanel');
+  const ns=relState.notifications.slice(0,12);
+  const pending=relState.alerts.filter(a=>!a.released).length;
+  const items=ns.map(n=>`
+    <button class="bell-item${n.read?'':' unread'}" onclick="openRelease('${n.id}')">
+      ${n.poster?`<img src="${n.poster}" alt="">`:'<span class="bell-ph"></span>'}
+      <span class="bell-txt">
+        <b>${esc(n.title)}</b>${esc(n.rest||' ist jetzt erhältlich')}
+        <small>${esc(n.sub||relSource(n))} · ${relWhen(n.date)}</small>
+      </span>
+      ${n.read?'':'<i class="bell-dot"></i>'}
+    </button>`).join('');
+  p.innerHTML=`
+    <div class="bell-head">
+      <span>Benachrichtigungen</span>
+      ${relUnread()?'<button class="bell-link" onclick="markAllRead()">Alle gelesen</button>':''}
+    </div>
+    <div class="bell-list">${items||`<div class="bell-empty">
+        <i class="fa-regular fa-bell"></i>
+        <b>Keine Meldungen</b>
+        <span>${pending?`Du wirst benachrichtigt, sobald einer deiner ${pending} vorgemerkten Filme erscheint.`
+          :'Merke Filme im Tab „Releases“ vor – hier erscheint dann eine Meldung, sobald sie auf Blu-ray oder als VoD erhältlich sind.'}</span>
+      </div>`}</div>
+    <div class="bell-foot">
+      ${pushToggleHTML()}
+      <button class="bell-link" onclick="closeBell();switchTab('releases')">Alle Erinnerungen ansehen →</button>
+    </div>`;
+}
+
+async function openRelease(nid){
+  await relPost('/api/releases/read',{id:nid});
+  closeBell(); switchTab('releases');
+}
+async function markAllRead(){ await relPost('/api/releases/read',{id:'all'}); }
+
+async function relPost(url,body){
+  try{
+    const d=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})}).then(r=>r.json());
+    applyRelState(d,true);
+    return d;
+  }catch{ showToast('⚠ Server nicht erreichbar',true); return null; }
+}
+
+// ── Browser-Push ──────────────────────────────────────────────────────────────
+let relPushOn=false;
+function pushSupported(){ return 'serviceWorker' in navigator&&'PushManager' in window&&'Notification' in window; }
+
+async function relRefreshPushState(){
+  relPushOn=false;
+  if(pushSupported()&&window.isSecureContext){
+    try{
+      const reg=await navigator.serviceWorker.getRegistration('/');
+      const sub=reg&&await reg.pushManager.getSubscription();
+      relPushOn=!!sub&&Notification.permission==='granted';
+    }catch{}
+  }
+}
+
+function pushToggleHTML(){
+  let msg='', dis='';
+  if(!relState.push.available){ msg='Push-Modul fehlt (pip install pywebpush)'; dis=' disabled'; }
+  else if(!pushSupported()){ msg='Dieser Browser unterstützt keine Push-Nachrichten'; dis=' disabled'; }
+  else if(!window.isSecureContext){ msg='Nur über http://localhost:8765 verfügbar'; dis=' disabled'; }
+  else if(Notification.permission==='denied'){ msg='Im Browser blockiert – in den Seiteneinstellungen erlauben'; dis=' disabled'; }
+  else msg=relPushOn?'Du erhältst Meldungen auch bei geschlossener Seite':'Meldungen auch bei geschlossener Seite erhalten';
+  return `<label class="push-toggle${dis?' off':''}">
+      <span class="push-txt"><b>Push-Benachrichtigungen</b><small>${msg}</small></span>
+      <span class="switch"><input type="checkbox" ${relPushOn?'checked':''}${dis} onchange="setPush(this.checked,this)"><i></i></span>
+    </label>`;
+}
+
+function b64ToU8(b){
+  const pad='='.repeat((4-b.length%4)%4);
+  const s=atob((b+pad).replace(/-/g,'+').replace(/_/g,'/'));
+  return Uint8Array.from(s,c=>c.charCodeAt(0));
+}
+
+async function setPush(on,box){
+  try{
+    const reg=await navigator.serviceWorker.register('/sw.js',{scope:'/'});
+    await navigator.serviceWorker.ready;
+    if(on){
+      const perm=await Notification.requestPermission();
+      if(perm!=='granted'){ showToast('Benachrichtigungen wurden nicht erlaubt',true); relPushOn=false; return refreshPushUI(); }
+      const sub=await reg.pushManager.subscribe({userVisibleOnly:true,applicationServerKey:b64ToU8(relState.push.key)});
+      await relPost('/api/push/subscribe',{subscription:sub.toJSON()});
+      relPushOn=true;
+      showToast('✓ Push-Benachrichtigungen aktiviert');
+    }else{
+      const sub=await reg.pushManager.getSubscription();
+      if(sub){ await relPost('/api/push/unsubscribe',{endpoint:sub.endpoint}); await sub.unsubscribe(); }
+      relPushOn=false;
+      showToast('Push-Benachrichtigungen deaktiviert');
+    }
+  }catch(e){
+    showToast('⚠ Push konnte nicht eingerichtet werden',true);
+    await relRefreshPushState();
+  }
+  refreshPushUI();
+}
+function refreshPushUI(){
+  if(!document.getElementById('bellPanel').hidden) renderBellPanel();
+  if(currentTab==='releases') renderReleases();
+}
+
+// ── Releases-Tab ──────────────────────────────────────────────────────────────
+function renderReleases(){
+  const body=document.getElementById('releases-body');
+  if(!body) return;
+  // Suchfeld nicht neu aufbauen, während getippt wird
+  let bar=document.getElementById('rel-bar');
+  if(!bar){
+    body.innerHTML=`<div id="rel-bar"></div><div id="rel-list"></div><section class="rel-sec rel-sug" id="rel-sug"></section>`;
+    bar=document.getElementById('rel-bar');
+    bar.innerHTML=`
+      <div class="seg-toggle rel-media" role="group" aria-label="Anzeigen"><button class="on" data-m="all" onclick="setRelMedia('all')">Alle</button><button data-m="movie" onclick="setRelMedia('movie')">Filme</button><button data-m="tv" onclick="setRelMedia('tv')">Serien</button></div>
+      <div class="rel-search">
+        <i class="fa-solid fa-magnifying-glass"></i>
+        <input type="text" id="rel-q" placeholder="Film oder Serie suchen und Erinnerung setzen…" autocomplete="off">
+        <div class="t10-results rel-results" id="rel-res" hidden></div>
+      </div>
+      <div class="rel-meta" id="rel-meta"></div>`;
+    bindRelSearch();
+  }
+  document.getElementById('rel-meta').innerHTML=`
+    <span>Letzte Prüfung: <b>${relAgo(relState.last_check)}</b></span>
+    <button class="bell-link" id="rel-check" onclick="relCheckNow(this)">Jetzt prüfen</button>
+    <span class="rel-push">${pushToggleHTML()}</span>`;
+
+  const allAlerts=relState.alerts;
+  const alerts=relMedia==='all'?allAlerts:allAlerts.filter(a=>(a.media==='tv'?'tv':'movie')===relMedia);
+  const upcoming=alerts.filter(a=>!a.released&&a.release).sort((a,b)=>a.release.date.localeCompare(b.release.date));
+  const open=alerts.filter(a=>!a.released&&!a.release).sort((a,b)=>(a.theatrical||'9').localeCompare(b.theatrical||'9'));
+  const done=alerts.filter(a=>a.released).sort((a,b)=>((b.release||{}).date||'').localeCompare((a.release||{}).date||''));
+
+  const sec=(title,list,hint)=>list.length?`
+    <section class="rel-sec">
+      <h3>${title}<span>${list.length}</span></h3>
+      ${hint?`<p class="rel-hint">${hint}</p>`:''}
+      <div class="rel-grid">${list.map(relCard).join('')}</div>
+    </section>`:'';
+
+  const list=document.getElementById('rel-list');
+  if(!allAlerts.length){
+    list.innerHTML=`<div class="rel-empty">
+      <div class="rel-empty-ico"><i class="fa-regular fa-bell"></i></div>
+      <h3>Noch keine Erinnerungen</h3>
+      <p>Suche oben einen Film oder eine Serie und merke sie vor.
+      ArcTime prüft einmal täglich die Termine in <b>Deutschland</b> und den <b>USA</b> und meldet sich bei dir,
+      sobald der Film erscheint – der frühere der beiden Termine zählt.</p>
+    </div>`;
+    renderRelSuggestions();
+    return;
+  }
+  list.innerHTML=
+    sec('Bald erhältlich',upcoming)+
+    sec('Termin noch offen',open,'Für diese Titel ist noch kein Termin bekannt (Filme: Blu-ray/VoD, Serien: Staffelstart bzw. Finale). Die tägliche Prüfung läuft weiter.')+
+    sec('Bereits erschienen',done)||`<div class="rel-sug-note">Keine ${relMedia==='tv'?'Serien':'Filme'} vorgemerkt.</div>`;
+  renderRelSuggestions();
+}
+
+function lbLink(id){
+  // Gleiches Letterboxd-Logo wie bei den Empfehlungen
+  return id?`<a class="rel-lb" href="https://letterboxd.com/tmdb/${id}/" target="_blank" rel="noopener" title="Auf Letterboxd öffnen" aria-label="Auf Letterboxd öffnen">${LETTERBOXD_MARK}</a>`:'';
+}
+
+function relCard(a){
+  let chip='', date='', sub='';
+  if(a.released&&a.release){
+    chip='<span class="rel-chip ok"><i class="fa-solid fa-check"></i> Erhältlich</span>';
+    date=relFmtDate(a.release.date);
+    sub=`${relSource(a.release)} · ${relWhen(a.release.date)}`;
+  }else if(a.release){
+    const n=relDays(a.release.date);
+    chip=`<span class="rel-chip soon">${n<=7?'Bald':'Geplant'}</span>`;
+    date=relFmtDate(a.release.date);
+    sub=`${relSource(a.release)} · ${relWhen(a.release.date)}`;
+  }else{
+    chip='<span class="rel-chip wait">Termin offen</span>';
+    date='Noch kein Termin';
+    sub=a.theatrical?`Kinostart ${relFmtDate(a.theatrical)}`:'Kein Kinostart bekannt';
+  }
+  let kino=a.release&&a.theatrical?`<div class="rel-kino">Kinostart ${relFmtDate(a.theatrical)}</div>`:'';
+  const isTv=a.media==='tv';
+  if(isTv){
+    const sv=a.series||{};
+    if(a.released) chip=`<span class="rel-chip ok"><i class="fa-solid fa-check"></i> ${a.event==='finale'?'Finale erschienen':'Gestartet'}</span>`;
+    else if(!a.release) sub=sv.state==='unannounced'?'Staffel noch nicht angekündigt':(a.event==='finale'?'Finale-Termin noch offen':'Start-Termin noch offen');
+    const bits=[sv.start?`Start ${relFmtDate(sv.start)}`:'',sv.finale?`Finale ${relFmtDate(sv.finale)}`:'',sv.episodes?`${sv.aired||0}/${sv.episodes} Folgen`:''].filter(Boolean);
+    kino=bits.length?`<div class="rel-kino">${bits.join(' · ')}</div>`:'';
+  }
+  let manual='';
+  if(relEditing===a.id){
+    manual=`<div class="rel-manual">
+      <input type="date" id="rel-md" value="${a.manual||''}" min="2000-01-01">
+      <button class="btn" onclick="relSaveManual('${a.id}')">Speichern</button>
+      <button class="btn btn-ghost" onclick="relEdit(null)">Abbrechen</button>
+    </div>`;
+  }else if(!a.released){
+    manual=a.manual
+      ?`<div class="rel-manual-link"><button class="bell-link" onclick="relEdit('${a.id}')">Eigenen Termin ändern</button> · <button class="bell-link" onclick="relClearManual('${a.id}')">entfernen</button></div>`
+      :`<div class="rel-manual-link"><button class="bell-link" onclick="relEdit('${a.id}')"><i class="fa-regular fa-calendar"></i> Termin selbst eintragen</button></div>`;
+  }
+  return `<article class="rel-card${a.released?' done':''}">
+    ${a.poster?`<img class="rel-poster" src="${a.poster}" alt="" loading="lazy">`:'<div class="rel-poster ph"></div>'}
+    <div class="rel-info">
+      <div class="rel-top">${chip}
+        <button class="rel-del" onclick="relDelete('${a.id}')" title="Erinnerung löschen" aria-label="Erinnerung für ${esc(a.title)} löschen"><i class="fa-regular fa-trash-can"></i></button>
+      </div>
+      <h4>${esc(a.title)}${isTv?`<small>Staffel ${a.season}</small>`:(a.year?`<small>${esc(a.year)}</small>`:'')}</h4>
+      <div class="rel-date">${date}</div>
+      <div class="rel-sub">${sub}</div>
+      ${kino}
+      ${manual}
+      <div class="rel-links">${isTv?tmdbLink(a.tmdb_id):lbLink(a.tmdb_id)}</div>
+    </div>
+  </article>`;
+}
+
+function relEdit(id){ relEditing=id; renderReleases(); const i=document.getElementById('rel-md'); if(i) i.focus(); }
+async function relSaveManual(id){
+  const v=(document.getElementById('rel-md')||{}).value;
+  if(!v){ showToast('Bitte ein Datum wählen',true); return; }
+  relEditing=null;
+  const d=await relPost('/api/releases/manual',{id,date:v});
+  if(d&&d.ok) showToast('✓ Termin gespeichert'); else showToast('⚠ Datum ungültig',true);
+}
+async function relClearManual(id){
+  await relPost('/api/releases/manual',{id,date:''});
+  showToast('Eigener Termin entfernt');
+}
+
+// ── „Vielleicht gefällt dir": kommende Filme passend zum Geschmack ─────────────
+const REL_SUG_MODES=[['taste','Für dich'],['recent','Aktueller Geschmack'],['people','Regie & Cast'],['surprise','Überrasch mich'],['popular','Beliebt']];
+const REL_SUG_WHEN=[['all','Alle'],['coming','Kommend'],['cinema','Im Kino']];
+const REL_SUG_DESC={taste:'Passend zu deinem gesamten Geschmack.',recent:'Passend zu dem, was du zuletzt gesehen und gut bewertet hast.',
+  people:'Neue Filme von Machern und Darstellern, deren Werke du mehrfach gut fandest.',surprise:'Passend, aber bewusst abwechslungsreich gemischt – bei jedem Aufruf neu.',
+  popular:'Die beliebtesten Filme aller TMDB-Nutzer – ohne Rücksicht auf deinen Geschmack.'};
+let relSugTimer=null, relSugMode='taste', relSugWhen='all';
+async function loadRelSuggestions(){
+  clearTimeout(relSugTimer);
+  try{
+    const d=await fetch(`/api/releases/suggestions?mode=${relSugMode}&when=${relSugWhen}`).then(r=>r.json());
+    relSug={status:d.status||'ready',items:d.items||[]};
+  }catch{ relSug={status:'error',items:[]}; }
+  renderRelSuggestions();
+  if(relSug.status==='loading'&&currentTab==='releases') relSugTimer=setTimeout(loadRelSuggestions,4000);
+}
+function setSugMode(m){ relSugMode=m; relSug={status:'loading',items:[]}; renderRelSuggestions(); loadRelSuggestions(); }
+function setSugWhen(w){ relSugWhen=w; relSug={status:'loading',items:[]}; renderRelSuggestions(); loadRelSuggestions(); }
+function renderRelSuggestions(){
+  const box=document.getElementById('rel-sug');
+  if(!box) return;
+  box.hidden=relMedia==='tv';
+  if(box.hidden) return;
+  const have=new Set(relState.alerts.filter(a=>a.media!=='tv').map(a=>a.tmdb_id));
+  const items=relSug.items.filter(i=>!have.has(i.tmdb_id));
+  let inner;
+  if(relSug.status==='loading'&&!items.length) inner='<div class="rel-sug-note"><span class="spin">↻</span> Suche passende Filme…</div>';
+  else if(!items.length) inner='<div class="rel-sug-note">Gerade nichts Passendes gefunden – versuch eine andere Kategorie.</div>';
+  else inner='<div class="rel-sug-row">'+items.map((i,n)=>`
+    <article class="sug-card">
+      <button class="sug-x" onclick="sugDismiss(${n})" title="Nicht mehr anzeigen" aria-label="${esc(i.title)} nicht mehr anzeigen"><i class="fa-solid fa-xmark"></i></button>
+      ${i.poster?`<img src="${i.poster}" alt="" loading="lazy">`:'<div class="sug-ph"></div>'}
+      <div class="sug-body">
+        <span class="sug-match">${relSugMode==='popular'?'Beliebt':i.match+'% Match'}</span>
+        <h4>${esc(i.title)}<small>${esc(i.year||'')}</small></h4>
+        <div class="sug-date">${i.in_cinemas?'Im Kino seit '+relFmtDate(i.date):'Kinostart '+relFmtDate(i.date)}</div>
+        <p>${esc(i.group||i.hook||'')}</p>
+        <div class="sug-actions">
+          <button class="rel-add" onclick="sugAdd(${n})"><i class="fa-regular fa-bell"></i> Erinnern</button>
+          ${lbLink(i.tmdb_id)}
+        </div>
+      </div>
+    </article>`).join('')+'</div>';
+  const chips=(list,cur,fn)=>list.map(([k,l])=>`<button class="rel-chipbtn${cur===k?' on':''}" onclick="${fn}('${k}')">${l}</button>`).join('');
+  box.innerHTML=`<h3>Vielleicht gefällt dir<span>${REL_SUG_MODES.find(m=>m[0]===relSugMode)[1]}</span></h3>
+    <div class="rel-filters">
+      <div class="rel-chips">${chips(REL_SUG_MODES,relSugMode,'setSugMode')}</div>
+      <div class="rel-chips">${chips(REL_SUG_WHEN,relSugWhen,'setSugWhen')}</div>
+    </div>
+    <p class="rel-hint">${REL_SUG_DESC[relSugMode]} Mit „Erinnern“ wirst du benachrichtigt, sobald ein Film auf Blu-ray oder als VoD erscheint.</p>${inner}`;
+  box._items=items;
+}
+async function sugAdd(n){
+  const i=(document.getElementById('rel-sug')._items||[])[n];
+  if(!i) return;
+  await relAdd({tmdb_id:i.tmdb_id,title:i.title,year:i.year,poster:i.poster});
+  renderRelSuggestions();
+}
+async function sugDismiss(n){
+  const box=document.getElementById('rel-sug');
+  const i=(box._items||[])[n];
+  if(!i) return;
+  relSug.items=relSug.items.filter(x=>x.tmdb_id!==i.tmdb_id);
+  renderRelSuggestions();
+  const post=undo=>fetch('/api/releases/dismiss',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tmdb_id:i.tmdb_id,undo})});
+  try{ await post(false); }catch{}
+  showToast(`„${i.title}“ wird nicht mehr vorgeschlagen`,false,async()=>{ try{ await post(true); }catch{} loadRelSuggestions(); });
+}
+
+async function relCheckNow(btn){
+  btn.disabled=true; btn.textContent='Prüfe…';
+  const d=await relPost('/api/releases/check');
+  if(d&&d.ok) showToast(d.new?`🔔 ${d.new} neue Meldung${d.new>1?'en':''}`:'✓ Alles geprüft – nichts Neues');
+  if(d&&d.errors) showToast('⚠ TMDB war für einige Filme nicht erreichbar',true);
+}
+
+async function relDelete(id){
+  const a=relState.alerts.find(x=>x.id===id);
+  if(!a) return;
+  const backup={tmdb_id:a.tmdb_id,title:a.title,year:a.year,poster:a.poster,media:a.media,season:a.season,event:a.event};
+  try{
+    const d=await fetch('/api/releases?id='+encodeURIComponent(id),{method:'DELETE'}).then(r=>r.json());
+    applyRelState(d,true);
+    showToast(`Erinnerung für „${a.title}“ gelöscht`,false,()=>relAdd(backup,true));
+  }catch{ showToast('⚠ Löschen fehlgeschlagen',true); }
+}
+
+async function relAdd(c,undo){
+  const d=await relPost('/api/releases/add',{tmdb_id:c.tmdb_id,title:c.title,year:c.year,poster:c.poster,media:c.media,season:c.season,event:c.event});
+  if(d&&d.ok&&!undo) showToast(`✓ Erinnerung für „${c.title}“ gesetzt`);
+  return d;
+}
+
+function bindRelSearch(){
+  const q=document.getElementById('rel-q'), res=document.getElementById('rel-res');
+  const search=async(kind,raw)=>{
+    try{
+      const d=await fetch('/api/title-search?kind='+kind+'&q='+encodeURIComponent(raw)).then(r=>r.json());
+      return (d.candidates||[]).map(x=>({...x,media:kind==='series'?'tv':'movie'}));
+    }catch{ return []; }
+  };
+  const run=()=>{
+    const my=++relSearchToken; clearTimeout(relSearchTimer);
+    const raw=q.value.trim();
+    if(raw.length<2){ res.hidden=true; return; }
+    res.innerHTML='<div class="t10-none">Suche…</div>'; res.hidden=false;
+    relSearchTimer=setTimeout(async()=>{
+      const wantM=relMedia!=='tv', wantT=relMedia!=='movie';
+      const [mv,tv]=await Promise.all([wantM?search('movie',raw):[],wantT?search('series',raw):[]]);
+      if(my!==relSearchToken) return;
+      // Bei "Alle" abwechselnd mischen, damit beide Arten oben auftauchen
+      let c=[];
+      if(wantM&&wantT){ for(let i=0;i<Math.max(mv.length,tv.length);i++){ if(mv[i]) c.push(mv[i]); if(tv[i]) c.push(tv[i]); } }
+      else c=wantM?mv:tv;
+      c=c.slice(0,10);
+      if(!c.length){ res.innerHTML='<div class="t10-none">Nichts gefunden</div>'; return; }
+      const have=new Set(relState.alerts.filter(a=>a.media!=='tv').map(a=>a.tmdb_id));
+      res.innerHTML=c.map((x,i)=>`<div class="t10-hit rel-hit" data-i="${i}">
+        ${x.poster?`<img src="${x.poster}" alt="">`:'<span class="t10-hit-ph"></span>'}
+        <span class="t10-hit-name">${esc(x.title)}<small>${esc(x.year||'')}</small></span>
+        <span class="rel-kind ${x.media}">${x.media==='tv'?'Serie':'Film'}</span>
+        ${x.media==='movie'&&have.has(x.tmdb_id)?'<span class="rel-set"><i class="fa-solid fa-check"></i> Gesetzt</span>'
+          :'<button class="rel-add" type="button"><i class="fa-regular fa-bell"></i> Erinnern</button>'}</div>`).join('');
+      res.querySelectorAll('.rel-hit').forEach(h=>h.onmousedown=ev=>ev.preventDefault());   // Fokus behalten
+      res.querySelectorAll('.rel-add').forEach(btn=>btn.onclick=async ev=>{
+        ev.stopPropagation();
+        const x=c[+btn.closest('.rel-hit').dataset.i];
+        q.value=''; res.hidden=true;
+        if(x.media==='tv') openTvPicker(x); else await relAdd(x);     // Serie: Staffel-Auswahl, Film: direkt
+      });
+    },350);
+  };
+  q.oninput=run; q.onfocus=run;
+  q.onblur=()=>setTimeout(()=>{res.hidden=true;},150);
+}
+
+// ── Serien: Staffel + Start/Finale wählen ─────────────────────────────────────
+let relPick=null;      // {cand, info, season, event, loading}
+
+function tmdbLink(id){
+  return id?`<a class="rel-lb rel-tmdb" href="https://www.themoviedb.org/tv/${id}" target="_blank" rel="noopener" title="Auf TMDB öffnen" aria-label="Auf TMDB öffnen">TMDB <i class="fa-solid fa-arrow-up-right-from-square"></i></a>`:'';
+}
+
+async function openTvPicker(cand){
+  relPick={cand,info:null,season:null,event:'start',loading:true};
+  renderTvPicker();
+  await loadTvPick(null);
+}
+async function loadTvPick(season){
+  relPick.loading=true; renderTvPicker();
+  let info=null;
+  try{
+    info=await fetch(`/api/releases/tv?id=${relPick.cand.tmdb_id}${season?'&season='+season:''}`).then(r=>r.json());
+  }catch{}
+  if(!relPick) return;
+  relPick.loading=false;
+  if(!info||!info.ok){ relPick.info={error:true}; renderTvPicker(); return; }
+  relPick.info=info;
+  relPick.season=info.detail?info.detail.number||info.detail.season:null;
+  // Sinnvolle Vorauswahl: läuft die Staffel schon, bleibt nur das Finale; sonst der Start
+  const d=info.detail||{};
+  relPick.event=(d.state==='running')?'finale':'start';
+  renderTvPicker();
+}
+function closeTvPicker(){
+  relPick=null;
+  const el=document.getElementById('rel-pick'); if(el) el.remove();
+  document.removeEventListener('keydown',tvPickKey);
+}
+function tvPickKey(ev){ if(ev.key==='Escape') closeTvPicker(); }
+
+function renderTvPicker(){
+  let el=document.getElementById('rel-pick');
+  if(!relPick){ if(el) el.remove(); return; }
+  if(!el){
+    el=document.createElement('div'); el.id='rel-pick'; el.className='rel-pick-bg';
+    el.onmousedown=ev=>{ if(ev.target===el) closeTvPicker(); };
+    document.body.appendChild(el);
+    document.addEventListener('keydown',tvPickKey);
+  }
+  const c=relPick.cand, info=relPick.info, d=info&&info.detail;
+  let body;
+  if(relPick.loading&&!info){
+    body='<div class="rel-sug-note"><span class="spin">↻</span> Lade Staffeln…</div>';
+  }else if(!info||info.error){
+    body='<div class="rel-sug-note">Die Serie konnte nicht geladen werden.</div>';
+  }else{
+    const sOpts=info.seasons.map(s=>`<option value="${s.number}"${s.number===relPick.season?' selected':''}>${esc(s.name)}${s.number===info.suggested?' – Vorschlag':''}</option>`).join('');
+    const state=d?d.state:'unannounced';
+    const startPast=state==='running'||state==='finished';
+    const finDone=state==='finished';
+    const reasonTxt={'läuft gerade':'läuft gerade','kommt als Nächstes':'kommt als Nächstes','noch nicht angekündigt':'noch nicht angekündigt','zuletzt erschienen':'zuletzt erschienen'}[info.reason]||'';
+    const sum=d?[
+      d.start?`Start ${relFmtDate(d.start)}`:'Start noch offen',
+      d.finale?`Finale ${relFmtDate(d.finale)}`:(d.last_known?`bisher bekannt bis ${relFmtDate(d.last_known)}`:'Finale noch offen'),
+      d.episodes?`${d.aired||0} von ${d.episodes} Folgen gelaufen`:''].filter(Boolean).join(' · '):'';
+    const opt=(ev,title,dateTxt,note,disabled)=>`
+      <label class="pick-opt${relPick.event===ev?' on':''}${disabled?' off':''}">
+        <input type="radio" name="tvev" value="${ev}" ${relPick.event===ev?'checked':''} ${disabled?'disabled':''} onchange="relPick.event='${ev}';renderTvPicker()">
+        <span class="pick-opt-txt"><b>${title}</b><small>${dateTxt}</small>${note?`<em>${note}</em>`:''}</span>
+      </label>`;
+    const startDate=d&&d.start?relFmtDate(d.start):'Termin noch offen';
+    const finDate=d&&d.finale?relFmtDate(d.finale):'Termin noch offen';
+    const canSave=!(finDone)&&!(relPick.event==='start'&&startPast);
+    body=`
+      <div class="pick-head">
+        ${c.poster?`<img src="${c.poster}" alt="">`:'<div class="sug-ph"></div>'}
+        <div><h3>${esc(info.title||c.title)}<small>${esc(info.year||'')}</small></h3>
+          <span class="rel-chip ${info.status==='Ended'||info.status==='Canceled'?'wait':'soon'}">${esc(info.status==='Returning Series'?'Läuft':info.status==='Ended'?'Beendet':info.status==='Canceled'?'Abgesetzt':info.status)}</span>
+        </div>
+      </div>
+      <label class="pick-lbl" for="pick-season">Staffel${reasonTxt?` <span class="pick-reason">· ${reasonTxt}</span>`:''}</label>
+      <select id="pick-season" onchange="loadTvPick(+this.value)">${sOpts}</select>
+      <p class="pick-sum">${relPick.loading?'Lade…':esc(sum)}</p>
+      <div class="pick-lbl">Wann soll ich dich erinnern?</div>
+      <div class="pick-opts">
+        ${opt('start','Staffelstart',startDate,startPast?'läuft bereits – Start nicht mehr wählbar':'',startPast)}
+        ${opt('finale','Staffelfinale',finDate,finDone?'bereits erschienen':(d&&!d.finale?'Termin kann sich noch ergeben – ich prüfe täglich':''),finDone)}
+      </div>`;
+  }
+  el.innerHTML=`<div class="rel-pick" role="dialog" aria-modal="true" aria-label="Serien-Erinnerung">
+    ${body}
+    <div class="pick-actions">
+      <button class="btn btn-ghost" onclick="closeTvPicker()">Abbrechen</button>
+      <button class="btn pick-save" onclick="saveTvAlert()" ${info&&info.ok&&d&&!(d.state==='finished')&&!(relPick.event==='start'&&(d.state==='running'||d.state==='finished'))?'':'disabled'}><i class="fa-regular fa-bell"></i> Erinnerung setzen</button>
+    </div>
+  </div>`;
+}
+
+async function saveTvAlert(){
+  if(!relPick||!relPick.info||!relPick.info.ok) return;
+  const i=relPick.info, c=relPick.cand;
+  const season=relPick.season, event=relPick.event;
+  closeTvPicker();
+  const d=await relPost('/api/releases/add',{media:'tv',tmdb_id:i.tmdb_id,title:i.title||c.title,year:i.year||c.year,poster:i.poster||c.poster,season,event});
+  if(d&&d.ok) showToast(d.duplicate?'Diese Erinnerung gibt es schon':`✓ Erinnerung für „${i.title}“ Staffel ${season} (${event==='finale'?'Finale':'Start'}) gesetzt`);
+}
+
+function setRelMedia(m){
+  relMedia=m;
+  document.querySelectorAll('.rel-media button').forEach(b=>b.classList.toggle('on',b.dataset.m===m));
+  const q=document.getElementById('rel-q');
+  q.placeholder=m==='tv'?'Serie suchen und Erinnerung setzen…':m==='movie'?'Film suchen und Erinnerung setzen…':'Film oder Serie suchen und Erinnerung setzen…';
+  if(q.value.trim().length>=2) q.dispatchEvent(new Event('input')); else document.getElementById('rel-res').hidden=true;
+  renderReleases();
+}
+
+// ── Start ─────────────────────────────────────────────────────────────────────
+(async function relInit(){
+  if('serviceWorker' in navigator&&window.isSecureContext){
+    try{ await navigator.serviceWorker.register('/sw.js',{scope:'/'}); }catch{}
+    navigator.serviceWorker.addEventListener('message',ev=>{
+      if(ev.data&&ev.data.type==='open-releases'){ loadReleases(true); switchTab('releases'); }
+    });
+  }
+  await loadReleases(true);
+  await relRefreshPushState();
+  renderBell();
+  if(location.hash==='#releases') switchTab('releases');
+  setInterval(()=>loadReleases(false),10*60*1000);
+  document.addEventListener('visibilitychange',()=>{ if(!document.hidden) loadReleases(false); });
+})();
+

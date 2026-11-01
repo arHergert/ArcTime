@@ -208,6 +208,7 @@ def _item_from_tmdb_list(r: dict, media: str) -> dict:
         'raw_genres': names,
         'rating': r.get('vote_average'), 'votes': r.get('vote_count') or 0,
         'lang': r.get('original_language') or '', 'full': False,
+        'popularity': r.get('popularity') or 0,
     }
 
 def _item_from_tmdb_full(d: dict, media: str) -> dict:
@@ -463,11 +464,15 @@ def _title_known(it: dict, titles: set) -> bool:
     except ValueError:
         return ('movie', nt, y) in titles
 
+MIN_REC_YEAR = '1980'
+
 def _eligible(it: dict, have_ids: set, titles: set, today_iso: str) -> bool:
     if it.get('gone') or it['id'] in have_ids:
         return False
     d = it.get('date') or ''
     if not d or d > today_iso:                   # unveröffentlicht / ohne Datum
+        return False
+    if d[:4] < MIN_REC_YEAR:                     # nichts vor 1980 empfehlen
         return False
     k = it['kind']
     if k == 'movie' and (it.get('votes') or 0) < 25:
@@ -1017,3 +1022,130 @@ def backfill_recommendations(state: dict, games: dict, diary: list, budget: int 
         return {'processed': len(flat), 'errors': errors, 'offline': offline, **status}
     finally:
         _bf_lock.release()
+
+
+# ── Kommende Filme passend zum Geschmack (für den Releases-Tab) ───────────────
+_upc_lock = threading.Lock()
+UPC_VERSION = '|v3'              # erhöhen, wenn sich die Pool-Abfrage ändert -> sofort neu laden
+_upc_busy = False
+
+def _refresh_upcoming_pool(today: date):
+    """Holt aktuell laufende und kommende Filme (TMDB discover, letzte 90 Tage bis +12 Monate),
+    legt sie im Empfehlungs-Pool ab und lädt Details (Keywords/Besetzung) für das Geschmacksprofil nach."""
+    global _version, _upc_busy
+    from datetime import timedelta
+    try:
+        start = (today - timedelta(days=90)).isoformat()
+        end = (today + timedelta(days=365)).isoformat()
+        found = {}
+        today_iso = today.isoformat()
+        # (Region, Seiten, ab Datum): laufende Filme + gezielt noch nicht erschienene
+        for region, pages, gte in (('DE', (1, 2), start), ('US', (1,), start), ('DE', (1, 2, 3, 4), today_iso), ('US', (1, 2), today_iso)):
+            for page in pages:
+                d = _tmdb('discover/movie', **{
+                    'primary_release_date.gte': gte, 'primary_release_date.lte': end,
+                    'sort_by': 'popularity.desc', 'include_adult': 'false',
+                    'region': region, 'page': page})
+                for r in d.get('results') or []:
+                    if r.get('id') and r.get('release_date'):
+                        found[r['id']] = _item_from_tmdb_list(r, 'movie')
+        with _lock:
+            db = _load()
+            for it in found.values():
+                _merge_item(it)
+            todo = [it['id'] for it in found.values() if not db['items'][it['id']].get('full')]
+        full = []
+        with ThreadPoolExecutor(max_workers=BACKFILL_WORKERS) as ex:
+            futs = [ex.submit(_task_candidate, cid) for cid in todo[:80]]
+            for f in futs:
+                try:
+                    r = f.result()
+                    if r[0] == 'item':
+                        full.append(r[1])
+                except Exception:
+                    pass
+        with _lock:
+            db = _load()
+            for it in full:
+                _merge_item(it)
+            db['upcoming'] = {'day': today.isoformat() + UPC_VERSION, 'ids': [f"movie:{i}" for i in found]}
+            _version += 1
+            _save()
+    except Exception as e:
+        print(f"  Upcoming-Pool: {type(e).__name__}: {e}")
+    finally:
+        _upc_busy = False
+
+UPC_MODES = ('taste', 'recent', 'people', 'surprise', 'popular')
+
+def upcoming_for_you(state: dict, games: dict, diary: list, limit: int = 12, mode: str = 'taste',
+                     when: str = 'all', dismissed=()) -> dict:
+    """Kommende/aktuelle Kinofilme, sortiert nach den Empfehlungs-Modi des Empfehlungen-Tabs
+    (Allzeit-/Aktueller Geschmack, Regie & Cast, Überrasch mich) oder nach TMDB-Beliebtheit.
+    Der Pool wird einmal täglich im Hintergrund aufgefrischt."""
+    global _upc_busy
+    if mode not in UPC_MODES:
+        mode = 'taste'
+    today = date.today()
+    with _lock:
+        up = _load().get('upcoming') or {}
+    fresh = up.get('day') == today.isoformat() + UPC_VERSION
+    if not fresh:
+        with _upc_lock:
+            if not _upc_busy:
+                _upc_busy = True
+                threading.Thread(target=_refresh_upcoming_pool, args=(today,), daemon=True).start()
+        if not up.get('ids'):
+            return {'status': 'loading', 'items': []}
+    status = 'ready' if fresh else 'loading'
+    hidden = {int(x) for x in dismissed if str(x).isdigit()}
+    with _lock:
+        db = _load()
+        ctx = _Ctx(state, games, diary, db)
+        today_iso = today.isoformat()
+        ids = [i for i in (db.get('upcoming') or {}).get('ids', [])
+               if i in ctx.items and not ctx.items[i].get('gone')]
+        cands = []
+        for i in ids:
+            it = ctx.items[i]
+            d = it.get('date') or ''
+            if (not d or d[:4] < MIN_REC_YEAR or not it.get('title') or i in ctx.have_ids
+                    or it.get('tmdb_id') in hidden or _title_known(it, ctx.titles)):
+                continue
+            if when == 'cinema' and d > today_iso:
+                continue
+            if when == 'coming' and d <= today_iso:
+                continue
+            if set(it.get('raw_genres') or []) & {'Documentary'} and (it.get('votes') or 0) < 5:
+                continue
+            cands.append(i)
+        ctx.cands = cands
+        if not cands:
+            return {'status': status, 'items': []}
+
+        if mode == 'popular':
+            sc = ctx.taste(None)
+            order = sorted(cands, key=lambda c: -(ctx.items[c].get('popularity') or 0))[:limit]
+            out = [_out(ctx.items[c], sc.get(c, 0), 'Beliebt bei allen TMDB-Nutzern') for c in order]
+        elif mode == 'people':
+            out = _mode_people(ctx)[:limit]
+        elif mode == 'surprise':
+            out = _mode_surprise(ctx, per_kind=limit)[:limit]
+        else:
+            sc = ctx.taste(RECENT_HALF_LIFE_DAYS if mode == 'recent' else None)
+            by_score = sorted(cands, key=lambda c: -sc.get(c, 0))
+            if when == 'all':
+                # Mischung: bestpassende kommende Filme + bestpassende, die gerade im Kino laufen
+                coming = [c for c in by_score if (ctx.items[c].get('date') or '') > today_iso][:limit // 2]
+                running = [c for c in by_score if c not in coming][:limit - len(coming)]
+                order = sorted(coming + running, key=lambda c: -sc.get(c, 0))
+            else:
+                order = by_score[:limit]
+            out = [_out(ctx.items[c], sc.get(c, 0), ctx.explain(c, RECENT_HALF_LIFE_DAYS if mode == 'recent' else None))
+                   for c in order]
+        for o in out:
+            it = ctx.items[o['key']]
+            o['tmdb_id'] = it.get('tmdb_id')
+            o['date'] = it.get('date') or ''
+            o['in_cinemas'] = bool(o['date']) and o['date'] <= today_iso
+    return {'status': status, 'items': out}

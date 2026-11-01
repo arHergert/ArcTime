@@ -7,7 +7,7 @@ from pathlib import Path
 
 from at_config import BASE, FILME, GCOVERS, PEOPLE, POSTERS, SERIEN, STATIC, scan_episodes
 from at_store import (_diary_lock, add_title_override, diary_csv, load_awards, load_config,
-                       load_diary, load_last_played, load_removed, save_awards, save_cache,
+                       load_diary, load_last_played, load_removed, load_top, save_awards, save_cache, save_top,
                        save_config, save_diary, save_last_played, save_removed)
 from at_scan import _key, scan_filme, scan_serien
 from at_metadata import (_dcov_key, _dl_poster_force, _games_lock, _tmdb_fetch_full,
@@ -15,9 +15,10 @@ from at_metadata import (_dcov_key, _dl_poster_force, _games_lock, _tmdb_fetch_f
                           get_tmdb_season_count, igdb_search_multi, load_diary_covers,
                           load_games, save_diary_covers, save_games, title_search_candidates,
                           tmdb_poster_candidates)
-from at_recommendations import backfill_recommendations, build_recommendations, set_feedback
+from at_recommendations import backfill_recommendations, build_recommendations, set_feedback, upcoming_for_you
 from at_import import _looks_like_serializd_html, import_backloggd_journal, import_csv, import_serializd_html, sync_letterboxd
 import at_refresh
+import at_releases
 from at_refresh import _poster_url, _reload_lock, build_api, refresh
 from at_playback import _MIME_BY_EXT, cast_to_lg, find_lg_renderer, play_file
 
@@ -42,6 +43,11 @@ class Handler(BaseHTTPRequestHandler):
         elif p == '/api/diary':      self._diary_get()
         elif p == '/api/diary/csv':  self._diary_csv()
         elif p == '/api/awards':     self._json({'awards': load_awards()})
+        elif p == '/api/top':        self._json({'top': load_top()})
+        elif p == '/api/releases':   self._json(at_releases.public_state())
+        elif p == '/sw.js':          self._service_worker()
+        elif p == '/api/releases/tv': self._releases_tv()
+        elif p == '/api/releases/suggestions': self._releases_suggestions()
         elif p == '/api/cast':       self._cast_get()
         elif p == '/api/letterboxd/config': self._lb_config_get()
         elif p == '/api/letterboxd/sync':   self._lb_sync_get()
@@ -75,6 +81,14 @@ class Handler(BaseHTTPRequestHandler):
         if   p == '/api/diary':   self._diary_post()
         elif p == '/api/import':  self._import_post()
         elif p == '/api/awards':  self._awards_post()
+        elif p == '/api/top':     self._top_post()
+        elif p == '/api/releases/add':   self._releases_add()
+        elif p == '/api/releases/check': self._json({'ok': True, **at_releases.check_all(), **at_releases.public_state()})
+        elif p == '/api/releases/read':  self._releases_read()
+        elif p == '/api/releases/manual': self._releases_manual()
+        elif p == '/api/releases/dismiss': self._releases_dismiss()
+        elif p == '/api/push/subscribe':   self._push_sub(True)
+        elif p == '/api/push/unsubscribe': self._push_sub(False)
         elif p == '/api/letterboxd/config': self._lb_config_post()
         elif p == '/api/games/add':    self._games_add()
         elif p == '/api/games/import': self._games_import()
@@ -92,6 +106,7 @@ class Handler(BaseHTTPRequestHandler):
         elif p == '/api/diary':   self._diary_delete()
         elif p == '/api/games':   self._games_delete()
         elif p == '/api/library': self._library_remove()
+        elif p == '/api/releases': self._releases_delete()
         else:                    self.send_error(404)
 
     def _html(self):
@@ -399,6 +414,114 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(import_csv(txt, _state))
         except Exception as e:
             self._json({'ok': False, 'error': f'Import fehlgeschlagen: {e}'}, 500)
+
+    # ── Releases (Erinnerungen) & Push ────────────────────────────────────────
+    def _body_json(self) -> dict:
+        try:
+            n = int(self.headers.get('Content-Length', 0))
+            d = json.loads(self.rfile.read(n)) if n else {}
+            return d if isinstance(d, dict) else {}
+        except Exception:
+            return {}
+
+    def _releases_add(self):
+        b = self._body_json()
+        try:
+            r = at_releases.add_alert(b.get('tmdb_id'), (b.get('title') or '').strip(), b.get('year'), b.get('poster'),
+                                      media=b.get('media') or 'movie', season=b.get('season'), event=b.get('event'))
+        except Exception as e:
+            self._json({'ok': False, 'error': str(e)}, 400); return
+        self._json({**r, **at_releases.public_state()})
+
+    def _releases_delete(self):
+        aid = _qs(self.path).get('id', [''])[0]
+        ok = at_releases.remove_alert(aid)
+        self._json({'ok': ok, **at_releases.public_state()})
+
+    def _releases_tv(self):
+        q = _qs(self.path)
+        try:
+            tid = int(q.get('id', [''])[0])
+            sn = q.get('season', [''])[0]
+            self._json(at_releases.tv_overview(tid, int(sn) if sn.isdigit() else None))
+        except Exception as e:
+            self._json({'ok': False, 'error': str(e)}, 400)
+
+    def _releases_suggestions(self):
+        q = _qs(self.path)
+        mode = (q.get('mode', ['taste'])[0] or 'taste')
+        when = (q.get('when', ['all'])[0] or 'all')
+        res = upcoming_for_you(_state, load_games(), load_diary(), mode=mode, when=when,
+                               dismissed=at_releases.dismissed_ids())
+        self._json({'ok': True, **res})
+
+    def _releases_dismiss(self):
+        b = self._body_json()
+        try:
+            at_releases.set_dismissed(b.get('tmdb_id'), not b.get('undo'))
+        except (TypeError, ValueError):
+            self._json({'ok': False}, 400); return
+        self._json({'ok': True})
+
+    def _releases_manual(self):
+        b = self._body_json()
+        ok = at_releases.set_manual(b.get('id') or '', (b.get('date') or '').strip() or None)
+        self._json({'ok': ok, **at_releases.public_state()})
+
+    def _releases_read(self):
+        at_releases.mark_read(self._body_json().get('id') or 'all')
+        self._json({'ok': True, **at_releases.public_state()})
+
+    def _push_sub(self, on: bool):
+        b = self._body_json()
+        if on:
+            ok = at_releases.subscribe(b.get('subscription'))
+        else:
+            at_releases.unsubscribe(b.get('endpoint') or '')
+            ok = True
+        self._json({'ok': ok, **at_releases.public_state()})
+
+    def _service_worker(self):
+        body = (STATIC / 'sw.js').read_bytes()
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/javascript; charset=utf-8')
+        self.send_header('Content-Length', len(body))
+        self.send_header('Cache-Control', 'no-cache')
+        self.end_headers(); self.wfile.write(body)
+
+    def _top_post(self):
+        """Speichert die Top-10-Liste eines Mediums (Reihenfolge = Platzierung)."""
+        try:
+            n = int(self.headers.get('Content-Length', 0))
+            data = json.loads(self.rfile.read(n)) if n else {}
+        except Exception:
+            self._json({'ok': False, 'error': 'Ungültige Daten'}, 400); return
+        kind, ids = data.get('kind'), data.get('ids')
+        if kind not in ('movie', 'season', 'game') or not isinstance(ids, list):
+            self._json({'ok': False, 'error': 'Ungültige Liste'}, 400); return
+        clean = []
+        for i in ids:
+            if isinstance(i, dict):
+                # Externer Treffer (TMDB/IGDB), nicht im Tagebuch: Cover einmalig lokal ablegen
+                title = str(i.get('title') or '').strip()
+                if not title:
+                    continue
+                poster = str(i.get('poster') or '')
+                year = str(i.get('year') or '')[:4]
+                if any(isinstance(c, dict) and c.get('title') == title and c.get('year') == year for c in clean):
+                    continue
+                if poster.startswith('http'):
+                    fname = _dl_poster_force(poster, f"top|{kind}|{title}|{year}")
+                    poster = f"/poster/{fname}" if fname else ''
+                clean.append({'ext': True, 'kind': kind, 'title': title, 'year': year, 'poster': poster or None})
+            elif isinstance(i, str) and i not in clean:
+                clean.append(i)
+        with _diary_lock:
+            t = load_top()
+            t[kind] = clean[:10]
+            t.setdefault('_updated', {})[kind] = time.strftime('%Y-%m-%dT%H:%M:%S')
+            save_top(t)
+        self._json({'ok': True, 'top': load_top()})
 
     def _awards_post(self):
         try:
@@ -856,6 +979,12 @@ _HTML_MID = """
   <button class="btn btn-ghost" id="reloadBtn" onclick="doReload()" title="Bibliothek aktualisieren">
     <span id="reloadIcon">↻</span>
   </button>
+  <div class="bell-wrap">
+    <button class="bell-btn" id="bellBtn" onclick="toggleBell(event)" aria-label="Benachrichtigungen" aria-expanded="false">
+      <i class="fa-solid fa-bell"></i><span class="bell-badge" id="bellBadge" hidden></span>
+    </button>
+    <div class="bell-panel" id="bellPanel" hidden></div>
+  </div>
 </header>
 
 <div class="tabs">
@@ -864,6 +993,7 @@ _HTML_MID = """
   <div class="tab" onclick="switchTab('diary')">Tagebuch</div>
   <div class="tab" onclick="switchTab('stats')">Rückblick</div>
   <div class="tab" onclick="switchTab('recommendations')">Empfehlungen</div>
+  <div class="tab" onclick="switchTab('releases')">Releases</div>
 </div>
 </div>
 
@@ -1110,6 +1240,10 @@ _HTML_MID = """
     </div>
   </div>
   <div id="rec-grid"></div>
+</div>
+
+<div id="section-releases" class="section">
+  <div id="releases-body"></div>
 </div>
 
 <div id="empty">Keine Einträge gefunden.</div>

@@ -29,6 +29,122 @@ def find_vlc() -> str | None:
 _VLC_ARGS = ['--fullscreen', '--audio-language=en,eng,english', '--sub-language=en,eng,english']
 
 
+# ── Untertitel-Auswahl: englisch, aber nie "forced" ────────────────────────────
+# VLC wählt bei --sub-language den ersten passenden Track - und das ist bei vielen
+# Dateien der "Forced"-Track (nur Fremdsprach-Passagen). Deshalb lesen wir die
+# Spurliste der MKV-Datei selbst (Matroska/EBML, nur Bordmittel, kein ffprobe nötig)
+# und übergeben VLC explizit den besten nicht-forcierten englischen Track.
+
+_EBML_SEGMENT, _EBML_TRACKS, _EBML_ENTRY, _EBML_CLUSTER = 0x18538067, 0x1654AE6B, 0xAE, 0x1F43B675
+_EN_CODES = {'en', 'eng', 'english'}
+_FORCED_NAME = re.compile(r'forced|forcierte|erzwungen|foreign\s*parts?|\bfpo\b|signs?\s*(?:&|and|/)?\s*songs?|\bsongs?\s*only\b', re.I)
+_LOW_PRIO_NAME = re.compile(r'commentary|kommentar|signs?\b|songs?\b', re.I)
+
+
+def _ebml_id(b: bytes, pos: int):
+    first = b[pos]
+    n = 1
+    while n <= 4 and not (first & (0x80 >> (n - 1))):
+        n += 1
+    return int.from_bytes(b[pos:pos + n], 'big'), pos + n
+
+def _ebml_size(b: bytes, pos: int):
+    first = b[pos]
+    n = 1
+    while n <= 8 and not (first & (0x80 >> (n - 1))):
+        n += 1
+    val = first & (0xFF >> n)
+    for x in b[pos + 1:pos + n]:
+        val = (val << 8) | x
+    if val == (1 << (7 * n)) - 1:      # alle Bits gesetzt = unbekannte Größe
+        val = -1
+    return val, pos + n
+
+def _ebml_children(b: bytes, start: int, end: int):
+    pos = start
+    while pos < end:
+        try:
+            eid, p = _ebml_id(b, pos)
+            size, p = _ebml_size(b, p)
+        except IndexError:
+            return
+        yield eid, p, (end if size < 0 else min(p + size, end))
+        if size < 0:
+            return
+        pos = p + size
+
+def read_mkv_subtitle_tracks(path: str) -> list | None:
+    """Liste der Untertitelspuren in Dateireihenfolge: [{lang, name, forced, default, codec}].
+    None, wenn die Datei kein MKV ist oder nicht lesbar."""
+    try:
+        with open(path, 'rb') as f:
+            buf = f.read(4 * 1024 * 1024)
+    except OSError:
+        return None
+    if buf[:4] != b'\x1a\x45\xdf\xa3':
+        return None
+    subs = []
+    for eid, ds, de in _ebml_children(buf, 0, len(buf)):
+        if eid != _EBML_SEGMENT:
+            continue
+        for sid, sds, sde in _ebml_children(buf, ds, de):
+            if sid == _EBML_CLUSTER:
+                break
+            if sid != _EBML_TRACKS:
+                continue
+            for tid, tds, tde in _ebml_children(buf, sds, sde):
+                if tid != _EBML_ENTRY:
+                    continue
+                t = {'type': 0, 'lang': 'eng', 'ietf': '', 'name': '', 'forced': False, 'default': True, 'codec': ''}
+                for cid, cds, cde in _ebml_children(buf, tds, tde):
+                    raw = buf[cds:cde]
+                    if cid == 0x83:    t['type'] = int.from_bytes(raw, 'big')
+                    elif cid == 0x55AA: t['forced'] = int.from_bytes(raw, 'big') == 1
+                    elif cid == 0x88:  t['default'] = int.from_bytes(raw, 'big') == 1
+                    elif cid == 0x22B59C: t['lang'] = raw.decode('ascii', 'ignore').strip('\0').lower()
+                    elif cid == 0x22B59D: t['ietf'] = raw.decode('ascii', 'ignore').strip('\0').lower()
+                    elif cid == 0x536E: t['name'] = raw.decode('utf-8', 'ignore').strip('\0')
+                    elif cid == 0x86:  t['codec'] = raw.decode('ascii', 'ignore')
+                if t['type'] == 17:
+                    subs.append(t)
+            return subs
+    return subs
+
+def _is_english(t: dict) -> bool:
+    lang = t['ietf'] or t['lang']
+    return lang.split('-')[0] in _EN_CODES
+
+def _is_forced(t: dict) -> bool:
+    return t['forced'] or bool(_FORCED_NAME.search(t['name'] or ''))
+
+def pick_subtitle_track(subs: list) -> int | None:
+    """Index (0-basiert unter den Untertitelspuren) des besten englischen Tracks, nie forced.
+    Gibt es nur forcierte englische Spuren, wird notgedrungen die beste davon genommen."""
+    en = [(i, t) for i, t in enumerate(subs) if _is_english(t)]
+    if not en:
+        return None
+    def rank(it):
+        i, t = it
+        # Bildbasierte Formate (PGS/VobSub) und Kommentar-/Signs-Spuren etwas nachrangig
+        return (1 if _LOW_PRIO_NAME.search(t['name'] or '') else 0, 1 if 'PGS' in t['codec'] or 'VOBSUB' in t['codec'] else 0, i)
+    normal = [x for x in en if not _is_forced(x[1])]
+    pool = normal or en
+    return min(pool, key=rank)[0]
+
+def vlc_subtitle_args(path: Path) -> list:
+    """Zusätzliche VLC-Argumente für die Untertitelwahl (leer, wenn nichts Besseres bekannt)."""
+    try:
+        if path.suffix.lower() != '.mkv':
+            return []
+        subs = read_mkv_subtitle_tracks(str(path))
+        if not subs:
+            return []
+        idx = pick_subtitle_track(subs)
+        return [f'--sub-track={idx}'] if idx is not None else []
+    except Exception:
+        return []
+
+
 def play_file(path_str: str) -> dict:
     p = Path(path_str)
     if not p.exists():
@@ -42,7 +158,7 @@ def play_file(path_str: str) -> dict:
                 # Kein CREATE_NO_WINDOW: das kann dazu führen, dass VLCs Fenster
                 # im Hintergrund/minimiert landet statt sichtbar im Vordergrund.
                 subprocess.Popen(
-                    [vlc, *_VLC_ARGS, str(p)],
+                    [vlc, *_VLC_ARGS, *vlc_subtitle_args(p), str(p)],
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 )
                 return {'ok': True}
@@ -61,7 +177,7 @@ def play_file(path_str: str) -> dict:
     if not vlc:
         return {'ok': False, 'error': 'VLC nicht gefunden'}
     try:
-        subprocess.Popen([vlc, *_VLC_ARGS, str(p)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.Popen([vlc, *_VLC_ARGS, *vlc_subtitle_args(p), str(p)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return {'ok': True}
     except Exception as e:
         return {'ok': False, 'error': str(e)}

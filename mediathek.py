@@ -19,6 +19,7 @@ Frontend liegt in static/app.js und static/app.css (nicht mehr inline).
 
 import sys, threading, webbrowser
 from http.server import ThreadingHTTPServer
+import at_releases
 
 from at_config import FILME, PORT, SERIEN, get_local_ip, setup_autostart
 from at_store import load_cache, load_config
@@ -93,6 +94,7 @@ if __name__ == '__main__':
                 print(f"  Letterboxd-Sync fehlgeschlagen: {e}")
 
     threading.Thread(target=_bg_startup_work, daemon=True).start()
+    at_releases.start_scheduler()     # täglicher Release-Check (TMDB)
 
     try:
         _httpd.serve_forever()
